@@ -154,6 +154,7 @@ export function renderApp(state: AppViewState) {
   const isChat = state.tab === "chat";
   const chatFocus = isChat && (state.settings.chatFocusMode || state.onboarding);
   const showThinking = state.onboarding ? false : state.settings.chatShowThinking;
+  const showInlineToolFlow = state.onboarding ? false : state.settings.chatShowInlineToolFlow;
   const assistantAvatarUrl = resolveAssistantAvatarUrl(state);
   const chatAvatarUrl = state.chatAvatarUrl ?? assistantAvatarUrl ?? null;
   const configValue =
@@ -996,6 +997,7 @@ export function renderApp(state: AppViewState) {
                 },
                 thinkingLevel: state.chatThinkingLevel,
                 showThinking,
+                showInlineToolFlow,
                 loading: state.chatLoading,
                 sending: state.chatSending,
                 compactionStatus: state.compactionStatus,
