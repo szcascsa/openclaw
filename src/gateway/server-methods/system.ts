@@ -1,6 +1,7 @@
 import { resolveMainSessionKeyFromConfig } from "../../config/sessions.js";
 import { getLastHeartbeatEvent } from "../../infra/heartbeat-events.js";
 import { setHeartbeatsEnabled } from "../../infra/heartbeat-runner.js";
+import { requestHeartbeatNow } from "../../infra/heartbeat-wake.js";
 import { enqueueSystemEvent, isSystemEventContextChanged } from "../../infra/system-events.js";
 import { listSystemPresence, updateSystemPresence } from "../../infra/system-presence.js";
 import { ErrorCodes, errorShape } from "../protocol/index.js";
@@ -82,6 +83,7 @@ export const systemHandlers: GatewayRequestHandlers = {
       scopes,
       tags,
     });
+    let queued = false;
     const isNodePresenceLine = text.startsWith("Node:");
     if (isNodePresenceLine) {
       const next = presenceUpdate.next;
@@ -119,10 +121,18 @@ export const systemHandlers: GatewayRequestHandlers = {
             sessionKey,
             contextKey: presenceUpdate.key,
           });
+          queued = true;
         }
       }
     } else {
       enqueueSystemEvent(text, { sessionKey });
+      queued = true;
+    }
+    if (queued) {
+      requestHeartbeatNow({
+        reason: "system-event",
+        sessionKey,
+      });
     }
     broadcastPresenceSnapshot({
       broadcast: context.broadcast,

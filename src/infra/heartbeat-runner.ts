@@ -46,11 +46,12 @@ import { isWithinActiveHours } from "./heartbeat-active-hours.js";
 import {
   buildExecEventPrompt,
   buildCronEventPrompt,
+  buildSystemEventPrompt,
   isCronSystemEvent,
   isExecCompletionEvent,
 } from "./heartbeat-events-filter.js";
 import { emitHeartbeatEvent, resolveIndicatorType } from "./heartbeat-events.js";
-import { resolveHeartbeatReasonKind } from "./heartbeat-reason.js";
+import { isHeartbeatEventDrivenReason, resolveHeartbeatReasonKind } from "./heartbeat-reason.js";
 import { resolveHeartbeatVisibility } from "./heartbeat-visibility.js";
 import {
   type HeartbeatRunResult,
@@ -60,11 +61,12 @@ import {
 } from "./heartbeat-wake.js";
 import type { OutboundSendDeps } from "./outbound/deliver.js";
 import { deliverOutboundPayloads } from "./outbound/deliver.js";
+import { buildOutboundSessionContext } from "./outbound/session-context.js";
 import {
   resolveHeartbeatDeliveryTarget,
   resolveHeartbeatSenderContext,
 } from "./outbound/targets.js";
-import { peekSystemEventEntries } from "./system-events.js";
+import { drainSystemEventEntries, peekSystemEventEntries } from "./system-events.js";
 
 export type HeartbeatDeps = OutboundSendDeps &
   ChannelHeartbeatDeps & {
@@ -470,6 +472,7 @@ function normalizeHeartbeatReply(
 
 type HeartbeatReasonFlags = {
   isExecEventReason: boolean;
+  isSystemEventReason: boolean;
   isCronEventReason: boolean;
   isWakeReason: boolean;
 };
@@ -488,6 +491,7 @@ function resolveHeartbeatReasonFlags(reason?: string): HeartbeatReasonFlags {
   const reasonKind = resolveHeartbeatReasonKind(reason);
   return {
     isExecEventReason: reasonKind === "exec-event",
+    isSystemEventReason: reasonKind === "system-event",
     isCronEventReason: reasonKind === "cron",
     isWakeReason: reasonKind === "wake" || reasonKind === "hook",
   };
@@ -511,10 +515,16 @@ async function resolveHeartbeatPreflight(params: {
   const hasTaggedCronEvents = pendingEventEntries.some((event) =>
     event.contextKey?.startsWith("cron:"),
   );
+  const hasPendingEvents = pendingEventEntries.length > 0;
   const shouldInspectPendingEvents =
-    reasonFlags.isExecEventReason || reasonFlags.isCronEventReason || hasTaggedCronEvents;
+    reasonFlags.isExecEventReason ||
+    reasonFlags.isSystemEventReason ||
+    reasonFlags.isCronEventReason ||
+    hasTaggedCronEvents ||
+    hasPendingEvents;
   const shouldBypassFileGates =
     reasonFlags.isExecEventReason ||
+    reasonFlags.isSystemEventReason ||
     reasonFlags.isCronEventReason ||
     reasonFlags.isWakeReason ||
     hasTaggedCronEvents;
@@ -557,15 +567,17 @@ type HeartbeatPromptResolution = {
   prompt: string;
   hasExecCompletion: boolean;
   hasCronEvents: boolean;
+  hasSystemEvents: boolean;
 };
 
 function resolveHeartbeatRunPrompt(params: {
   cfg: OpenClawConfig;
   heartbeat?: HeartbeatConfig;
   preflight: HeartbeatPreflight;
+  pendingEventEntries: ReturnType<typeof peekSystemEventEntries>;
   canRelayToUser: boolean;
 }): HeartbeatPromptResolution {
-  const pendingEventEntries = params.preflight.pendingEventEntries;
+  const pendingEventEntries = params.pendingEventEntries;
   const pendingEvents = params.preflight.shouldInspectPendingEvents
     ? pendingEventEntries.map((event) => event.text)
     : [];
@@ -576,15 +588,21 @@ function resolveHeartbeatRunPrompt(params: {
         isCronSystemEvent(event.text),
     )
     .map((event) => event.text);
+  const systemEvents = pendingEventEntries
+    .filter((event) => isCronSystemEvent(event.text))
+    .map((event) => event.text);
   const hasExecCompletion = pendingEvents.some(isExecCompletionEvent);
   const hasCronEvents = cronEvents.length > 0;
+  const hasSystemEvents = systemEvents.length > 0;
   const prompt = hasExecCompletion
     ? buildExecEventPrompt({ deliverToUser: params.canRelayToUser })
     : hasCronEvents
       ? buildCronEventPrompt(cronEvents, { deliverToUser: params.canRelayToUser })
+      : hasSystemEvents
+        ? buildSystemEventPrompt(systemEvents, { deliverToUser: params.canRelayToUser })
       : resolveHeartbeatPrompt(params.cfg, params.heartbeat);
 
-  return { prompt, hasExecCompletion, hasCronEvents };
+  return { prompt, hasExecCompletion, hasCronEvents, hasSystemEvents };
 }
 
 export async function runHeartbeatOnce(opts: {
@@ -596,20 +614,21 @@ export async function runHeartbeatOnce(opts: {
   deps?: HeartbeatDeps;
 }): Promise<HeartbeatRunResult> {
   const cfg = opts.cfg ?? loadConfig();
+  const isEventDrivenRun = isHeartbeatEventDrivenReason(opts.reason);
   const agentId = normalizeAgentId(opts.agentId ?? resolveDefaultAgentId(cfg));
   const heartbeat = opts.heartbeat ?? resolveHeartbeatConfig(cfg, agentId);
-  if (!heartbeatsEnabled) {
+  if (!heartbeatsEnabled && !isEventDrivenRun) {
     return { status: "skipped", reason: "disabled" };
   }
-  if (!isHeartbeatEnabledForAgent(cfg, agentId)) {
+  if (!isHeartbeatEnabledForAgent(cfg, agentId) && !isEventDrivenRun) {
     return { status: "skipped", reason: "disabled" };
   }
-  if (!resolveHeartbeatIntervalMs(cfg, undefined, heartbeat)) {
+  if (!resolveHeartbeatIntervalMs(cfg, undefined, heartbeat) && !isEventDrivenRun) {
     return { status: "skipped", reason: "disabled" };
   }
 
   const startedAt = opts.deps?.nowMs?.() ?? Date.now();
-  if (!isWithinActiveHours(cfg, heartbeat, startedAt)) {
+  if (!isEventDrivenRun && !isWithinActiveHours(cfg, heartbeat, startedAt)) {
     return { status: "skipped", reason: "quiet-hours" };
   }
 
@@ -635,6 +654,13 @@ export async function runHeartbeatOnce(opts: {
     return { status: "skipped", reason: preflight.skipReason };
   }
   const { entry, sessionKey, storePath } = preflight.session;
+  const pendingEventEntries =
+    preflight.shouldInspectPendingEvents && preflight.pendingEventEntries.length > 0
+      ? drainSystemEventEntries(sessionKey)
+      : preflight.pendingEventEntries;
+  if (preflight.isSystemEventReason && pendingEventEntries.length === 0) {
+    return { status: "skipped", reason: "no-system-events" };
+  }
   const previousUpdatedAt = entry?.updatedAt;
   const delivery = resolveHeartbeatDeliveryTarget({ cfg, entry, heartbeat });
   const heartbeatAccountId = heartbeat?.accountId?.trim();
@@ -667,10 +693,11 @@ export async function runHeartbeatOnce(opts: {
   const canRelayToUser = Boolean(
     delivery.channel !== "none" && delivery.to && visibility.showAlerts,
   );
-  const { prompt, hasExecCompletion, hasCronEvents } = resolveHeartbeatRunPrompt({
+  const { prompt, hasExecCompletion, hasCronEvents, hasSystemEvents } = resolveHeartbeatRunPrompt({
     cfg,
     heartbeat,
     preflight,
+    pendingEventEntries,
     canRelayToUser,
   });
   const ctx = {
@@ -681,7 +708,13 @@ export async function runHeartbeatOnce(opts: {
     OriginatingTo: delivery.to,
     AccountId: delivery.accountId,
     MessageThreadId: delivery.threadId,
-    Provider: hasExecCompletion ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat",
+    Provider: hasExecCompletion
+      ? "exec-event"
+      : hasCronEvents
+        ? "cron-event"
+        : hasSystemEvents
+          ? "system-event"
+          : "heartbeat",
     SessionKey: sessionKey,
   };
   if (!visibility.showAlerts && !visibility.showOk && !visibility.useIndicator) {
@@ -696,6 +729,11 @@ export async function runHeartbeatOnce(opts: {
   }
 
   const heartbeatOkText = responsePrefix ? `${responsePrefix} ${HEARTBEAT_TOKEN}` : HEARTBEAT_TOKEN;
+  const outboundSession = buildOutboundSessionContext({
+    cfg,
+    agentId,
+    sessionKey,
+  });
   const canAttemptHeartbeatOk = Boolean(
     visibility.showOk && delivery.channel !== "none" && delivery.to,
   );
@@ -721,7 +759,7 @@ export async function runHeartbeatOnce(opts: {
       accountId: delivery.accountId,
       threadId: delivery.threadId,
       payloads: [{ text: heartbeatOkText }],
-      agentId,
+      session: outboundSession,
       deps: opts.deps,
     });
     return true;
@@ -914,7 +952,7 @@ export async function runHeartbeatOnce(opts: {
       channel: delivery.channel,
       to: delivery.to,
       accountId: deliveryAccountId,
-      agentId,
+      session: outboundSession,
       threadId: delivery.threadId,
       payloads: [
         ...reasoningPayloads,
@@ -1079,28 +1117,31 @@ export function startHeartbeatRunner(opts: {
   };
 
   const run: HeartbeatWakeHandler = async (params) => {
+    const reason = params?.reason;
+    const isEventDriven = isHeartbeatEventDrivenReason(reason);
+    const requestedAgentId = params?.agentId ? normalizeAgentId(params.agentId) : undefined;
+    const requestedSessionKey = params?.sessionKey?.trim() || undefined;
+    const hasTargetedRequest = Boolean(requestedSessionKey || requestedAgentId);
+
     if (state.stopped) {
       return {
         status: "skipped",
         reason: "disabled",
       } satisfies HeartbeatRunResult;
     }
-    if (!heartbeatsEnabled) {
+    if (!heartbeatsEnabled && !isEventDriven) {
       return {
         status: "skipped",
         reason: "disabled",
       } satisfies HeartbeatRunResult;
     }
-    if (state.agents.size === 0) {
+    if (state.agents.size === 0 && !(isEventDriven && hasTargetedRequest)) {
       return {
         status: "skipped",
         reason: "disabled",
       } satisfies HeartbeatRunResult;
     }
 
-    const reason = params?.reason;
-    const requestedAgentId = params?.agentId ? normalizeAgentId(params.agentId) : undefined;
-    const requestedSessionKey = params?.sessionKey?.trim() || undefined;
     const isInterval = reason === "interval";
     const startedAt = Date.now();
     const now = startedAt;
@@ -1109,20 +1150,21 @@ export function startHeartbeatRunner(opts: {
     if (requestedSessionKey || requestedAgentId) {
       const targetAgentId = requestedAgentId ?? resolveAgentIdFromSessionKey(requestedSessionKey);
       const targetAgent = state.agents.get(targetAgentId);
-      if (!targetAgent) {
+      if (!targetAgent && !isEventDriven) {
         scheduleNext();
         return { status: "skipped", reason: "disabled" };
       }
+      const targetHeartbeat = targetAgent?.heartbeat ?? resolveHeartbeatConfig(state.cfg, targetAgentId);
       try {
         const res = await runOnce({
           cfg: state.cfg,
-          agentId: targetAgent.agentId,
-          heartbeat: targetAgent.heartbeat,
+          agentId: targetAgentId,
+          heartbeat: targetHeartbeat,
           reason,
           sessionKey: requestedSessionKey,
           deps: { runtime: state.runtime },
         });
-        if (res.status !== "skipped" || res.reason !== "disabled") {
+        if (targetAgent && (res.status !== "skipped" || res.reason !== "disabled")) {
           advanceAgentSchedule(targetAgent, now);
         }
         scheduleNext();
@@ -1132,7 +1174,9 @@ export function startHeartbeatRunner(opts: {
         log.error(`heartbeat runner: targeted runOnce threw unexpectedly: ${errMsg}`, {
           error: errMsg,
         });
-        advanceAgentSchedule(targetAgent, now);
+        if (targetAgent) {
+          advanceAgentSchedule(targetAgent, now);
+        }
         scheduleNext();
         return { status: "failed", reason: errMsg };
       }
