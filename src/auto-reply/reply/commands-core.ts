@@ -51,6 +51,16 @@ let HANDLERS: CommandHandler[] | null = null;
 
 export type ResetCommandAction = "new" | "reset";
 
+function isCanonicalResetCommand(commandBodyNormalized: string): boolean {
+  const commandBody = commandBodyNormalized.trim().toLowerCase();
+  return (
+    commandBody === "/new" ||
+    commandBody.startsWith("/new ") ||
+    commandBody === "/reset" ||
+    commandBody.startsWith("/reset ")
+  );
+}
+
 function resolveResetCommandAction(params: HandleCommandsParams): ResetCommandAction | null {
   const targetSessionKey =
     params.ctx.CommandSource === "native" ? params.ctx.CommandTargetSessionKey?.trim() : undefined;
@@ -225,10 +235,13 @@ export async function handleCommands(params: HandleCommandsParams): Promise<Comm
   const resetAction = resolveResetCommandAction(params);
   const resetRequested = resetAction !== null;
   if (resetRequested && !params.command.isAuthorizedSender) {
-    logVerbose(
-      `Ignoring /reset from unauthorized sender: ${params.command.senderId || "<unknown>"}`,
-    );
-    return { shouldContinue: false };
+    if (isCanonicalResetCommand(params.command.commandBodyNormalized)) {
+      logVerbose(
+        `Ignoring /reset from unauthorized sender: ${params.command.senderId || "<unknown>"}`,
+      );
+      return { shouldContinue: false };
+    }
+    return { shouldContinue: true };
   }
 
   // Trigger internal hook for reset/new commands

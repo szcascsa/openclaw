@@ -1009,6 +1009,43 @@ describe("handleCommands hooks", () => {
     );
     spy.mockRestore();
   });
+
+  it("does not block unauthorized custom reset triggers", async () => {
+    const cfg = {
+      commands: { text: true },
+      channels: { whatsapp: { allowFrom: ["*"] } },
+      session: {
+        resetTriggers: ["/fresh"],
+      },
+    } as OpenClawConfig;
+    const params = buildParams("/fresh keep context", cfg, {
+      CommandAuthorized: false,
+      SenderId: "unauthorized",
+    });
+    params.command.isAuthorizedSender = false;
+    params.command.senderId = "unauthorized";
+
+    const result = await handleCommands(params);
+
+    expect(result.shouldContinue).toBe(true);
+  });
+
+  it("still blocks unauthorized canonical /reset commands", async () => {
+    const cfg = {
+      commands: { text: true },
+      channels: { whatsapp: { allowFrom: ["*"] } },
+    } as OpenClawConfig;
+    const params = buildParams("/reset now", cfg, {
+      CommandAuthorized: false,
+      SenderId: "unauthorized",
+    });
+    params.command.isAuthorizedSender = false;
+    params.command.senderId = "unauthorized";
+
+    const result = await handleCommands(params);
+
+    expect(result.shouldContinue).toBe(false);
+  });
 });
 
 describe("handleCommands context", () => {
